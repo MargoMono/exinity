@@ -25,6 +25,9 @@ $ mysql -h 127.0.0.1 -P 3306 -u docker -p
 
 Pass: docker
 
+$ use test_db;
+$ select * from ticks;
+
 ```
 
 
