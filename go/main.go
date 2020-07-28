@@ -6,12 +6,47 @@ import (
 	"fmt"
 	"log"
 	"strconv"
-	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 )
+
+const (
+	websocketURL = "wss://ws-feed.pro.coinbase.com"
+	dbConnection = "docker:docker@tcp(db:3306)/test_db"
+)
+
+type Service struct {
+	ws       *websocket.Conn
+	db       *sql.DB
+	wsAnswer chan *Answer
+}
+
+func NewConnection(websocketURL string, dbConnection string) (*Service, error) {
+
+	dialer := websocket.Dialer{
+		Subprotocols:    []string{},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+
+	ws, _, err := dialer.Dial(websocketURL, nil)
+
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	db, err := sql.Open("mysql", dbConnection)
+
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	return &Service{ws, db, make(chan *Answer)}, nil
+}
 
 type Channel struct {
 	Name       string   `json:"name"`
@@ -23,6 +58,19 @@ type WsRequest struct {
 	Channels []*Channel `json:"channels"`
 }
 
+func (service *Service) subscribe(currencyPairs []string) error {
+
+	request, err := json.Marshal(&WsRequest{"subscribe", []*Channel{
+		{"ticker", currencyPairs},
+	}})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return service.ws.WriteMessage(websocket.TextMessage, request)
+}
+
 type Answer struct {
 	Type      string `json:"type"`
 	ProductID string `json:"product_id"`
@@ -30,100 +78,79 @@ type Answer struct {
 	Ask       string `json:"best_ask"`
 }
 
-func main() {
-
-	productIds := [3]string{
-		"ETH-BTC",
-		"BTC-USD",
-		"BTC-EUR",
-	}
-
-	wg := new(sync.WaitGroup)
-	wg.Add(len(productIds))
-
-	for i := 0; i < len(productIds); i++ {
-
-		request, err := json.Marshal(&WsRequest{"subscribe", []*Channel{
-			{"ticker", []string{productIds[i]}},
-		}})
-
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		go getData(wg, request)
-	}
-
-	wg.Wait()
-}
-
-func getData(wg *sync.WaitGroup, request []byte) {
-
-	defer wg.Done()
-
-	dialer := websocket.Dialer{
-		Subprotocols:    []string{},
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-	}
-
-	conn, _, err := dialer.Dial("wss://ws-feed.pro.coinbase.com", nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	conn.WriteMessage(websocket.TextMessage, request)
-
+func (service *Service) setIntoTicks() {
 	for {
+		select {
+		case data := <-service.wsAnswer:
+			if data.Type == "ticker" {
 
-		_, ms, err := conn.ReadMessage()
-		if err != nil {
-			log.Fatal(err)
-		}
+				bid, err := strconv.ParseFloat(data.Bid, 64)
 
-		setIntoTicks(ms)
-	}
+				if err != nil {
+					log.Fatal(err)
+				}
 
-}
+				ask, err := strconv.ParseFloat(data.Ask, 64)
 
-func setIntoTicks(ms []byte) {
+				if err != nil {
+					log.Fatal(err)
+				}
 
-	var answer Answer
-	json.Unmarshal(ms, &answer)
+				result, err := service.db.Exec("insert into ticks (timestamp, symbol, bid, ask) values (?, ?, ?, ?)",
+					makeTimestamp(), data.ProductID, bid, ask)
 
-	db, err := sql.Open("mysql", "docker:docker@tcp(db:3306)/test_db")
+				if err != nil {
+					log.Fatal(err)
+				}
 
-	if err != nil {
-		log.Fatal(err)
-	}
+				rowsAffected, err := result.RowsAffected()
 
-	defer db.Close()
-
-	if answer.Type == "ticker" {
-
-		bid, err := strconv.ParseFloat(answer.Bid, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		ask, err := strconv.ParseFloat(answer.Ask, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		result, err := db.Exec("insert into ticks (timestamp, symbol, bid, ask) values (?, ?, ?, ?)",
-			makeTimestamp(), answer.ProductID, bid, ask)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		rowsAffected, err := result.RowsAffected()
-		if rowsAffected == 1 {
-			fmt.Println("Я сделяль запись для инстумента " + answer.ProductID)
+				if rowsAffected == 1 {
+					fmt.Println("Я сделяль запись для инстумента " + data.ProductID)
+				}
+			}
 		}
 	}
 }
 
 func makeTimestamp() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
+}
+
+func main() {
+	currencPairs := []string{
+		"ETH-BTC",
+		"BTC-USD",
+		"BTC-EUR",
+	}
+
+	service, err := NewConnection(websocketURL, dbConnection)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	service.subscribe(currencPairs)
+	go service.setIntoTicks()
+
+	defer func() {
+		service.ws.Close()
+		service.db.Close()
+	}()
+
+	for {
+		_, ms, err := service.ws.ReadMessage()
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var answer Answer
+
+		if err := json.Unmarshal(ms, &answer); err != nil {
+			log.Fatal(err)
+		}
+
+		service.wsAnswer <- &answer
+	}
 }
